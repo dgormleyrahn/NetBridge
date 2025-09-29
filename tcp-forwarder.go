@@ -341,10 +341,24 @@ func (f *Forwarder) handleListener(listener net.Listener, rule ForwardingRule) {
 
 func (f *Forwarder) handleConnection(clientConn net.Conn, rule ForwardingRule) {
 	defer f.wg.Done()
-	defer clientConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			log.Printf("Error closing client connection: %v", err)
+		}
+	}()
 
 	clientAddr := clientConn.RemoteAddr().String()
 	log.Printf("New connection from %s for %s", clientAddr, rule.Name)
+
+	// Enable TCP keepalive
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			log.Printf("Failed to set keepalive on client connection: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			log.Printf("Failed to set keepalive period on client connection: %v", err)
+		}
+	}
 
 	// Resolve target address using DNS cache
 	var targetAddr string
@@ -361,55 +375,101 @@ func (f *Forwarder) handleConnection(clientConn net.Conn, rule ForwardingRule) {
 		targetAddr = net.JoinHostPort(ip.String(), fmt.Sprintf("%d", rule.TargetPort))
 	}
 
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	targetConn, err := net.DialTimeout("tcp", targetAddr, 30*time.Second)
 	if err != nil {
 		log.Printf("Failed to connect to target %s for %s from %s: %v", targetAddr, rule.Name, clientAddr, err)
 		return
 	}
-	defer targetConn.Close()
+	defer func() {
+		if err := targetConn.Close(); err != nil {
+			log.Printf("Error closing target connection: %v", err)
+		}
+	}()
+
+	// Enable TCP keepalive on target connection
+	if tcpConn, ok := targetConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			log.Printf("Failed to set keepalive on target connection: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			log.Printf("Failed to set keepalive period on target connection: %v", err)
+		}
+	}
 
 	log.Printf("Established connection: %s -> %s (%s)", clientAddr, targetAddr, rule.Name)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go f.copyData(clientConn, targetConn, &wg, fmt.Sprintf("%s->%s (%s)", clientAddr, targetAddr, rule.Name))
-	go f.copyData(targetConn, clientConn, &wg, fmt.Sprintf("%s->%s (%s)", targetAddr, clientAddr, rule.Name))
+	// Use channels to signal when each direction completes
+	done := make(chan struct{})
+
+	go f.copyData(clientConn, targetConn, &wg, fmt.Sprintf("%s->%s (%s)", clientAddr, targetAddr, rule.Name), done)
+	go f.copyData(targetConn, clientConn, &wg, fmt.Sprintf("%s->%s (%s)", targetAddr, clientAddr, rule.Name), done)
 
 	wg.Wait()
+	close(done)
 	log.Printf("Connection closed: %s -> %s (%s)", clientAddr, targetAddr, rule.Name)
 }
 
-func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction string) {
+func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction string, done chan struct{}) {
 	defer wg.Done()
 
 	buffer := make([]byte, 32*1024)
-	totalBytes := int64(0)
 
 	for {
 		select {
 		case <-f.ctx.Done():
 			return
+		case <-done:
+			return
 		default:
 		}
 
-		src.SetReadDeadline(time.Now().Add(30 * time.Second))
+		// Increase timeout to 5 minutes for long-polling support (Exchange OWA)
+		if err := src.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			log.Printf("Failed to set read deadline in %s: %v", direction, err)
+			return
+		}
 		n, err := src.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
+				// Check if it's a timeout error - those are normal for idle connections
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// Timeout on read - connection is idle, close gracefully
+					return
+				}
 				log.Printf("Read error in %s: %v", direction, err)
+			}
+			// Signal the other goroutine to stop by closing the write side
+			if tcpConn, ok := dst.(*net.TCPConn); ok {
+				if err := tcpConn.CloseWrite(); err != nil {
+					log.Printf("Failed to close write side in %s: %v", direction, err)
+				}
 			}
 			return
 		}
 
 		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			_, err := dst.Write(buffer[:n])
-			if err != nil {
-				log.Printf("Write error in %s: %v", direction, err)
+			if err := dst.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				log.Printf("Failed to set write deadline in %s: %v", direction, err)
 				return
 			}
-			totalBytes += int64(n)
+			written, err := dst.Write(buffer[:n])
+			if err != nil {
+				log.Printf("Write error in %s: %v", direction, err)
+				// Signal the other goroutine to stop
+				if tcpConn, ok := src.(*net.TCPConn); ok {
+					if err := tcpConn.CloseRead(); err != nil {
+						log.Printf("Failed to close read side in %s: %v", direction, err)
+					}
+				}
+				return
+			}
+			if written != n {
+				log.Printf("Short write in %s: wrote %d of %d bytes", direction, written, n)
+				return
+			}
 		}
 	}
 }
@@ -430,6 +490,8 @@ func (f *Forwarder) WaitForShutdown() {
 
 func (f *Forwarder) cleanup() {
 	for _, listener := range f.listeners {
-		listener.Close()
+		if err := listener.Close(); err != nil {
+			log.Printf("Error closing listener: %v", err)
+		}
 	}
 }
