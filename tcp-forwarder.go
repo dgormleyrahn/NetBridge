@@ -441,12 +441,7 @@ func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction st
 				}
 				log.Printf("Read error in %s: %v", direction, err)
 			}
-			// Signal the other goroutine to stop by closing the write side
-			if tcpConn, ok := dst.(*net.TCPConn); ok {
-				if err := tcpConn.CloseWrite(); err != nil {
-					log.Printf("Failed to close write side in %s: %v", direction, err)
-				}
-			}
+			// EOF or error - just return and let deferred cleanup handle connection close
 			return
 		}
 
@@ -458,12 +453,6 @@ func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction st
 			written, err := dst.Write(buffer[:n])
 			if err != nil {
 				log.Printf("Write error in %s: %v", direction, err)
-				// Signal the other goroutine to stop
-				if tcpConn, ok := src.(*net.TCPConn); ok {
-					if err := tcpConn.CloseRead(); err != nil {
-						log.Printf("Failed to close read side in %s: %v", direction, err)
-					}
-				}
 				return
 			}
 			if written != n {
