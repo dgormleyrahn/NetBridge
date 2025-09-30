@@ -350,13 +350,18 @@ func (f *Forwarder) handleConnection(clientConn net.Conn, rule ForwardingRule) {
 	clientAddr := clientConn.RemoteAddr().String()
 	log.Printf("New connection from %s for %s", clientAddr, rule.Name)
 
-	// Enable TCP keepalive
+	// Enable TCP keepalive with Exchange-friendly settings
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 		if err := tcpConn.SetKeepAlive(true); err != nil {
 			log.Printf("Failed to set keepalive on client connection: %v", err)
 		}
-		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		// Use 2-minute keepalive for Exchange (ActiveSync/MAPI can be idle for long periods)
+		if err := tcpConn.SetKeepAlivePeriod(2 * time.Minute); err != nil {
 			log.Printf("Failed to set keepalive period on client connection: %v", err)
+		}
+		// Disable Nagle's algorithm for better interactive performance (MAPI/OWA)
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			log.Printf("Failed to set no-delay on client connection: %v", err)
 		}
 	}
 
@@ -391,8 +396,13 @@ func (f *Forwarder) handleConnection(clientConn net.Conn, rule ForwardingRule) {
 		if err := tcpConn.SetKeepAlive(true); err != nil {
 			log.Printf("Failed to set keepalive on target connection: %v", err)
 		}
-		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		// Use 2-minute keepalive for Exchange (ActiveSync/MAPI can be idle for long periods)
+		if err := tcpConn.SetKeepAlivePeriod(2 * time.Minute); err != nil {
 			log.Printf("Failed to set keepalive period on target connection: %v", err)
+		}
+		// Disable Nagle's algorithm for better interactive performance (MAPI/OWA)
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			log.Printf("Failed to set no-delay on target connection: %v", err)
 		}
 	}
 
@@ -426,8 +436,9 @@ func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction st
 		default:
 		}
 
-		// Increase timeout to 5 minutes for long-polling support (Exchange OWA)
-		if err := src.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+		// Increase timeout to 35 minutes for Exchange ActiveSync PING (can wait up to 30 mins)
+		// Also supports MAPI over HTTP and OWA long-polling
+		if err := src.SetReadDeadline(time.Now().Add(35 * time.Minute)); err != nil {
 			log.Printf("Failed to set read deadline in %s: %v", direction, err)
 			return
 		}
@@ -446,7 +457,8 @@ func (f *Forwarder) copyData(src, dst net.Conn, wg *sync.WaitGroup, direction st
 		}
 
 		if n > 0 {
-			if err := dst.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			// Allow up to 2 minutes for writes (Exchange responses can be large)
+			if err := dst.SetWriteDeadline(time.Now().Add(2 * time.Minute)); err != nil {
 				log.Printf("Failed to set write deadline in %s: %v", direction, err)
 				return
 			}
